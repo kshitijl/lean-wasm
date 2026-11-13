@@ -1,33 +1,40 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lean in the browser</title>
-<link rel="stylesheet" href="style.css">
-</head>
-<body>
-<header>
-  <h1>Lean in the browser</h1>
-  <p>Lean 4 and its language server run in this page, in WebAssembly. Nothing is sent to a
-  server. The first visit downloads about 215 MB.</p>
-  <p id="status">Lean is starting.</p>
-</header>
-<main>
-  <section id="left">
-    <div id="editor"></div>
-    <p id="header-note" class="warning" hidden>Lean's language server here serves files that
-    start with the line <code>import Std.WP</code> and import nothing else. Put that line back
-    to see messages and goals again.</p>
-    <p><button id="check">Check the whole file</button> <span id="check-result"></span></p>
-  </section>
-  <section id="right">
-    <h2>Goal at the cursor</h2>
-    <pre id="goal">Lean is starting.</pre>
-    <h2>Messages <span id="progress"></span></h2>
-    <ul id="messages"></ul>
-  </section>
-</main>
-<script type="module" src="demo.bundle.js"></script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lean in the browser</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Lean in the browser</h1>
+      <p>
+        Lean 4 and its language server, compiled to wasm, running locally in the
+        browser.
+      </p>
+      <p id="status">Lean is starting.</p>
+    </header>
+    <main>
+      <section id="left">
+        <div id="editor"></div>
+        <p id="header-note" class="warning" hidden>
+          Lean's language server here serves files that start with the line
+          <code>import Std.WP</code> and import nothing else. Put that line back
+          to see messages and goals again.
+        </p>
+        <p>
+          <button id="check">Check the whole file</button>
+          <span id="check-result"></span>
+        </p>
+      </section>
+      <section id="right">
+        <h2>Goal at the cursor</h2>
+        <pre id="goal">Lean is starting.</pre>
+        <h2>Messages <span id="progress"></span></h2>
+        <ul id="messages"></ul>
+      </section>
+    </main>
+    <script type="module" src="demo.bundle.js"></script>
+  </body>
 </html>
