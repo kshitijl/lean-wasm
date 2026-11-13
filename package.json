@@ -2,7 +2,7 @@
   "name": "lean-wasm",
   "private": true,
   "scripts": {
-    "build": "esbuild demo/src/demo.js --bundle --format=esm --minify --sourcemap --external:/lib/* --outfile=demo/demo.bundle.js",
+    "build": "esbuild demo/src/demo.js --bundle --format=esm --minify --sourcemap --external:../lib/* --outfile=demo/demo.bundle.js",
     "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {

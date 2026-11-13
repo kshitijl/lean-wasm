@@ -2,7 +2,8 @@
 // puts the cursor in a proof and reads the goal, hovers a name with the mouse, types to get
 // completions and ∀, Cmd-clicks a name, edits the file, breaks and restores the header, runs a
 // whole-file check, and crashes Lean to see it restart with the document open again.
-// Needs `uv run serve.py` (port 8771) and `npm run build`.
+// Needs `uv run serve.py` (port 8771) and `npm run build`. DEMO_URL=<url> tests the demo
+// elsewhere, such as on the site that tools/sync-to-site.sh fills.
 //
 //   node test/chrome.mjs [directory for screenshots]
 import { spawn } from 'node:child_process';
@@ -27,8 +28,18 @@ const pending = new Map();
 const logs = [];
 ws.onmessage = (e) => {
   const m = JSON.parse(e.data);
-  if (m.id) { pending.get(m.id)(m); pending.delete(m.id); }
+  if (m.id) { pending.get(m.id)?.(m); pending.delete(m.id); }
   else if (m.method === 'Runtime.consoleAPICalled') logs.push(m.params.args.map((a) => a.value ?? a.description).join(' '));
+  else if (m.method === 'Network.responseReceived' && /(lean\.wasm|std-wp\.snap)/.test(m.params.response.url)) {
+    const h = Object.fromEntries(Object.entries(m.params.response.headers).map(([k, v]) => [k.toLowerCase(), v]));
+    console.log(`download: ${m.params.response.url.replace(/\?.*/, '')} ${m.params.response.status}, encoding ${h['content-encoding'] ?? 'none'}`);
+  }
+  else if (m.method === 'Target.attachedToTarget') {
+    // A worker: watch its network too (Lean downloads its large files there), then let it run.
+    const sessionId = m.params.sessionId;
+    ws.send(JSON.stringify({ id: ++nextId, sessionId, method: 'Network.enable' }));
+    ws.send(JSON.stringify({ id: ++nextId, sessionId, method: 'Runtime.runIfWaitingForDebugger' }));
+  }
   else if (m.method === 'Runtime.exceptionThrown') logs.push('EXC ' + JSON.stringify(m.params.exceptionDetails).slice(0, 500));
 };
 const send = (method, params = {}) => new Promise((r) => { pending.set(++nextId, r); ws.send(JSON.stringify({ id: nextId, method, params })); });
@@ -57,7 +68,9 @@ let failed = false;
 try {
   await send('Runtime.enable');
   await send('Page.enable');
-  await send('Page.navigate', { url: 'http://127.0.0.1:8771/demo/' });
+  await send('Network.enable');
+  await send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
+  await send('Page.navigate', { url: process.env.DEMO_URL ?? 'http://127.0.0.1:8771/demo/' });
   await waitFor(`document.getElementById('status').textContent.startsWith('Lean started')`, 'Lean started', 120);
   console.log(await text('status'));
 

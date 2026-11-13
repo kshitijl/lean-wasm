@@ -6,11 +6,13 @@ import { hoverTooltip } from '@codemirror/view';
 import { setDiagnostics, lintGutter } from '@codemirror/lint';
 import { autocompletion } from '@codemirror/autocomplete';
 import { StreamLanguage } from '@codemirror/language';
-// Not bundled: the host finds its worker next to itself.
-import { startLean, DOCUMENT_URI } from '/lib/lean-host.js';
+// Not bundled: the host finds its worker next to itself. The path is relative to the bundle,
+// demo/demo.bundle.js, so that the demo works under any directory of a site.
+import { startLean, DOCUMENT_URI } from '../lib/lean-host.js';
 import { expandAbbreviation, markdownBlocks, offsetToPosition, positionToOffset, toEditorDiagnostics } from './convert.js';
 
 const $ = (id) => document.getElementById(id);
+if (window.self !== window.top) document.documentElement.classList.add('framed');
 const SAMPLE = `import Std.WP
 
 /-- The larger of two integers. -/
@@ -37,7 +39,16 @@ theorem le_myMax (a b : Int) : ∀ c, c ≤ a → c ≤ myMax a b := by
 
 const lean = startLean();
 const status = (text) => { $('status').textContent = text; };
-lean.ready().then((ms) => status(`Lean started in ${ms} ms.`), (e) => status(`${e.message}. Reload the page.`));
+lean.ready().then((ms) => status(`Lean started in ${ms} ms.`), (e) => {
+  // Lean's threads need a cross-origin isolated page. A page that frames this one may not be (its
+  // browser may not support the policy it uses); this page on its own is.
+  if (!self.crossOriginIsolated && window.self !== window.top) {
+    $('status').replaceChildren('This browser cannot run Lean inside this page. ',
+      Object.assign(document.createElement('a'), { href: location.href, target: '_blank', textContent: 'Open the demo on its own page.' }));
+    return;
+  }
+  status(`${e.message}. Reload the page.`);
+});
 lean.onRestart((reason) => status(`Lean stopped (${reason}) and was restarted.`));
 
 // ---- Lean syntax, roughly: comments, strings, numbers and keywords ------------------------

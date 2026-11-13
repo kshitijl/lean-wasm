@@ -9,15 +9,16 @@ header h1 { margin: 0 0 4px; font-size: 22px; }
 header p { margin: 0 0 6px; color: var(--muted); }
 #status { color: var(--fg); }
 main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 20px; padding: 12px 24px 24px; max-width: 1400px; margin: 0 auto; }
-@media (max-width: 800px) { main { grid-template-columns: 1fr; padding: 12px 16px; } header { padding: 16px 16px 0; } }
+@media (max-width: 800px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px; } header { padding: 16px 16px 0; } }
 #editor { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-#editor .cm-editor { height: 70vh; font-size: 14px; }
+/* Capped, so that a frame that fits its height to the page (klauria.tech) reaches a fixed point. */
+#editor .cm-editor { height: min(70vh, 40rem); font-size: 14px; }
 #editor .cm-scroller { font-family: ui-monospace, Menlo, monospace; }
 h2 { font-size: 15px; margin: 0 0 6px; }
 #progress { font-weight: normal; color: var(--muted); }
 pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.45 ui-monospace, Menlo, monospace; }
 #goal { background: var(--panel); border-radius: 6px; padding: 10px 12px; min-height: 4em; margin-bottom: 18px; }
-#messages { list-style: none; margin: 0; padding: 0; max-height: 45vh; overflow: auto; }
+#messages { list-style: none; margin: 0; padding: 0; max-height: min(45vh, 24rem); overflow: auto; }
 #messages li { border-left: 3px solid var(--line); padding: 4px 0 4px 10px; margin-bottom: 8px; }
 #messages li.error { border-color: var(--error); }
 #messages li.warning { border-color: var(--warning); }
@@ -28,3 +29,5 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.45 
 .hover pre { margin: 2px 0 6px; }
 .hover p { margin: 4px 0; font-size: 13px; }
 button#check { font: inherit; padding: 4px 12px; }
+/* Framed in another page, which has its own title: keep only the status line. */
+.framed header h1, .framed header p:not(#status) { display: none; }
