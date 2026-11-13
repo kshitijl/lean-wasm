@@ -1,0 +1,4 @@
+{
+  "//": "The demo sources are ES modules. Not set for the whole repository: Node must load runtime/lean.js as a script.",
+  "type": "module"
+}

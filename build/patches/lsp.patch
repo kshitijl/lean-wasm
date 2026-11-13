@@ -1,0 +1,206 @@
+diff --git a/src/Lean/Elab/Import.lean b/src/Lean/Elab/Import.lean
+index 1335a89776..d53ac525d8 100644
+--- a/src/Lean/Elab/Import.lean
++++ b/src/Lean/Elab/Import.lean
+@@ -138,6 +138,16 @@ where
+       go parent messages
+     | .num parent _, messages => go parent messages
+ 
++/--
++Environments imported ahead of time, keyed by the imported module names and whether the file is
++a `module`. A host that cannot read `.olean` files, such as the browser build (the `lean_wasm_*`
++entry points in `Lean.Shell`), loads a saved image and registers its environment here.
++`processHeaderCore` then uses it for a header with the same imports, and so does the language
++server, which imports through it.
++-/
++builtin_initialize preloadedHeaderEnvs : IO.Ref (Array ((Array Name × Bool) × Environment)) ←
++  IO.mkRef #[]
++
+ def processHeaderCore
+     (startPos : String.Pos.Raw) (imports : Array Import) (isModule : Bool)
+     (opts : Options) (messages : MessageLog) (inputCtx : Parser.InputContext)
+@@ -154,10 +164,13 @@ def processHeaderCore
+       .exported
+   else
+     .private
++  let preloaded := (← preloadedHeaderEnvs.get).find? (·.1 == (imports.map (·.module), isModule))
+   let (env, messages) ← try
+-    let env ←
+-      importModules (leakEnv := leakEnv) (loadExts := true) (level := level)
+-        imports opts trustLevel plugins arts
++    let env ← match preloaded with
++      | some (_, env) => pure env
++      | none =>
++        importModules (leakEnv := leakEnv) (loadExts := true) (level := level)
++          imports opts trustLevel plugins arts
+     pure (env, messages)
+   catch e =>
+     let env ← mkEmptyEnvironment
+diff --git a/src/Lean/Shell.lean b/src/Lean/Shell.lean
+index f5a09bdf0f..81ed386959 100644
+--- a/src/Lean/Shell.lean
++++ b/src/Lean/Shell.lean
+@@ -73,7 +73,9 @@ with the same header skip the import. Returns 0 on success and 1 on failure.
+ def wasmLoadSnapshot (path : String) : IO UInt32 := do
+   try
+     let env ← unsafe Elab.loadHeaderSnapshotEnv ⟨path⟩
+-    wasmEnvCache.modify (·.push ((env.header.imports.map (·.module), env.header.isModule), env))
++    let key := (env.header.imports.map (·.module), env.header.isModule)
++    wasmEnvCache.modify (·.push (key, env))
++    Elab.preloadedHeaderEnvs.modify (·.push (key, env))
+     return 0
+   catch e =>
+     IO.eprintln s!"loading snapshot {path} failed: {e}"
+@@ -98,6 +100,101 @@ def wasmCheck (code fileName : String) : IO UInt32 := do
+     IO.println (← msg.toJson).compress
+   return if msgs.hasErrors then 1 else 0
+ 
++/-! ## Lean's language server, in the same process
++
++Normally the watchdog starts one `lean --worker` process per open file and talks LSP to it over
++stdin and stdout. A browser cannot start processes. So the host starts the file worker on a
++thread of its own (`lean_wasm_lsp_start`) and exchanges LSP messages with it through two
++channels: `lean_wasm_lsp_send` hands it one message, `lean_wasm_lsp_recv` collects what it wrote.
++The worker serves one document for the life of the page.
++-/
++
++structure WasmLsp where
++  /-- Bytes from the host to the worker. -/
++  toWorker : Std.Channel.Sync ByteArray
++  /-- Bytes the worker wrote, for the host. -/
++  fromWorker : Std.Channel.Sync ByteArray
++
++builtin_initialize wasmLsp : IO.Ref (Option WasmLsp) ← IO.mkRef none
++
++def findNewline (b : ByteArray) : Option Nat := Id.run do
++  for i in [0:b.size] do
++    if b[i]! == 10 then
++      return some i
++  return none
++
++/-- Reads one line, waiting for the host to send more bytes when needed. -/
++partial def wasmLspGetLine (buf : IO.Ref ByteArray) (input : Std.Channel.Sync ByteArray) :
++    IO String := do
++  let b ← buf.get
++  match findNewline b with
++  | some i =>
++    buf.set (b.extract (i + 1) b.size)
++    return (String.fromUTF8? (b.extract 0 (i + 1))).getD ""
++  | none =>
++    let more ← input.recv
++    buf.set (b ++ more)
++    wasmLspGetLine buf input
++
++/-- Reads exactly `n` bytes, waiting for the host to send more when needed. -/
++partial def wasmLspRead (buf : IO.Ref ByteArray) (input : Std.Channel.Sync ByteArray)
++    (n : Nat) : IO ByteArray := do
++  let b ← buf.get
++  if b.size >= n then
++    buf.set (b.extract n b.size)
++    return b.extract 0 n
++  else
++    let more ← input.recv
++    buf.set (b ++ more)
++    wasmLspRead buf input n
++
++/--
++Starts Lean's file worker on a thread of its own. The host then sends it `initialize` and
++`textDocument/didOpen`, as an editor would. Returns 0 on success, 1 if it was already started.
++-/
++@[export lean_wasm_lsp_start]
++def wasmLspStart (_ : Unit) : IO UInt32 := do
++  if (← wasmLsp.get).isSome then
++    return 1
++  let toWorker ← Std.Channel.Sync.new
++  let fromWorker ← Std.Channel.Sync.new
++  wasmLsp.set (some { toWorker, fromWorker })
++  let buf ← IO.mkRef ByteArray.empty
++  let stream : IO.FS.Stream := {
++    flush := pure ()
++    read := fun n => wasmLspRead buf toWorker n.toNat
++    write := fun b => fromWorker.send b
++    getLine := wasmLspGetLine buf toWorker
++    putStr := fun s => fromWorker.send s.toUTF8
++    isTty := pure false
++  }
++  let err ← IO.getStderr
++  let _ ← IO.asTask (prio := .dedicated) do
++    try
++      Server.FileWorker.initAndRunWorker stream stream err {}
++    catch e =>
++      IO.eprintln s!"language server stopped: {e}"
++  return 0
++
++/-- Hands one LSP message (with its `Content-Length` header) to the worker. -/
++@[export lean_wasm_lsp_send]
++def wasmLspSend (msg : String) : IO UInt32 := do
++  let some lsp ← wasmLsp.get
++    | return 1
++  lsp.toWorker.send msg.toUTF8
++  return 0
++
++/-- Everything the worker wrote since the last call, or the empty string. Does not wait. -/
++@[export lean_wasm_lsp_recv]
++partial def wasmLspRecv (_ : Unit) : IO String := do
++  let some lsp ← wasmLsp.get
++    | return ""
++  let rec drain (acc : ByteArray) : IO ByteArray := do
++    match ← lsp.fromWorker.tryRecv with
++    | some b => drain (acc ++ b)
++    | none => return acc
++  return (String.fromUTF8? (← drain .empty)).getD ""
++
+ /-- Whether Lean was built with an address sanitizer enabled. -/
+ @[extern "lean_internal_has_address_sanitizer"]
+ opaque Internal.hasAddressSanitizer (_ : Unit) : Bool
+diff --git a/src/util/shell.cpp b/src/util/shell.cpp
+index 0e17bc922a..a465a21072 100644
+--- a/src/util/shell.cpp
++++ b/src/util/shell.cpp
+@@ -294,6 +294,9 @@ extern "C" void __llvm_profile_set_filename(const char *) __attribute__((weak));
+ // The Lean side is in `src/Lean/Shell.lean`.
+ extern "C" obj_res lean_wasm_load_snapshot(obj_arg path);
+ extern "C" obj_res lean_wasm_check(obj_arg code, obj_arg file_name);
++extern "C" obj_res lean_wasm_lsp_start(obj_arg unit);
++extern "C" obj_res lean_wasm_lsp_send(obj_arg msg);
++extern "C" obj_res lean_wasm_lsp_recv(obj_arg unit);
+ extern "C" void emscripten_runtime_keepalive_push(void);
+ 
+ // Runs `f` on a thread with Lean's stack size, as `lean_main` does. Returns 2 if it throws.
+@@ -342,6 +345,36 @@ extern "C" LEAN_EXPORT int lean_wasm_load_snapshot_file(char const * path) {
+ extern "C" LEAN_EXPORT int lean_wasm_check_source(char const * code, char const * file_name) {
+     return wasm_run([&]() { return lean_wasm_check(lean_mk_string(code), lean_mk_string(file_name)); });
+ }
++
++/* Starts Lean's language server (one file worker) on a thread of its own. Returns 0 on success.
++   The host then talks LSP to it with the two functions below. */
++extern "C" LEAN_EXPORT int lean_wasm_lsp_start_server() {
++    return wasm_run([&]() { return lean_wasm_lsp_start(lean_box(0)); });
++}
++
++/* Hands one LSP message, `Content-Length` header included, to the server. Returns 0 on success.
++   Shallow, so it runs on the caller's stack. */
++extern "C" LEAN_EXPORT int lean_wasm_lsp_send_message(char const * msg) {
++    try {
++        return get_io_uint32_result(lean_wasm_lsp_send(lean_mk_string(msg)));
++    } catch (lean::throwable & ex) {
++        std::cerr << ex.what() << std::endl;
++        return 2;
++    }
++}
++
++/* Returns what the server wrote since the last call, possibly "", as a string that the caller
++   must `free`. Does not wait. */
++extern "C" LEAN_EXPORT char * lean_wasm_lsp_receive() {
++    object * r = lean_wasm_lsp_recv(lean_box(0));
++    if (io_result_is_error(r)) {
++        dec(r);
++        return strdup("");
++    }
++    char * out = strdup(lean_string_cstr(io_result_get_value(r)));
++    dec(r);
++    return out;
++}
+ #endif
+ 
+ extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {

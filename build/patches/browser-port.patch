@@ -1,0 +1,268 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d625f73666..d783a451c1 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -929,7 +929,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+   # flags and settings, to every link.
+   string(
+     APPEND LEAN_EXE_LINKER_FLAGS
+-    " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} -lnodefs.js -sEXIT_RUNTIME=1 -sMAIN_MODULE=2 -sEXPORTED_FUNCTIONS=@${LIB}/temp/lean_exports.json -sEXPORTED_RUNTIME_METHODS=FS,ENV,UTF8ToString,lengthBytesUTF8,stringToUTF8 -sERROR_ON_UNDEFINED_SYMBOLS=0"
++    " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} -lnodefs.js -sEXIT_RUNTIME=1 -sMAIN_MODULE=2 -sEXPORTED_FUNCTIONS=@${LIB}/temp/lean_exports.json -sEXPORTED_RUNTIME_METHODS=FS,ENV,UTF8ToString,lengthBytesUTF8,stringToUTF8,stringToNewUTF8 -sPTHREAD_POOL_SIZE=16 -sERROR_ON_UNDEFINED_SYMBOLS=0"
+   )
+ endif()
+ 
+diff --git a/src/Lean/Elab/Frontend.lean b/src/Lean/Elab/Frontend.lean
+index 2cc066851c..c9de9e8333 100644
+--- a/src/Lean/Elab/Frontend.lean
++++ b/src/Lean/Elab/Frontend.lean
+@@ -266,6 +266,22 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
+     result? := some { parsed with
+       processedSnap := .finished none newProcessed } }
+ 
++/--
++Loads the post-import environment of a snapshot saved by `--incr-header-save` and runs the
++initializers of its modules, as `runFrontend` does for `--incr-load`. For hosts that elaborate
++many inputs on one imported environment (the `lean_wasm_*` entry points in `Lean.Shell`).
++-/
++unsafe def loadHeaderSnapshotEnv (fname : System.FilePath) (opts : Options := {}) :
++    IO Environment := do
++  let incr ← loadIncrSnapshot fname
++  let some res := incr.snap.processedResult.get
++    | throw <| IO.userError s!"snapshot {fname} has no processed header"
++  withImporting do
++    Lean.runInitAttrsForModules res.cmdState.env incr.initModIdxs opts
++  -- `withImporting` clears the flag, and a later `importModules` needs it
++  enableInitializersExecution
++  return res.cmdState.env
++
+ def runFrontend
+     (input : String)
+     (opts : Options)
+@@ -359,9 +375,14 @@ def runFrontend
+       IO Unit := do
+     let toSave : IncrSnapshot :=
+       { snap := snapToSave, initModIdxs := getRegularInitAttrModIdxs env }
++    -- A snapshot normally points into the regions of the imported `.olean` files, which must
++    -- then be mapped at their saved addresses on load. WebAssembly cannot map at an address, and
++    -- in its 32-bit address space the saved ranges of separately built files overlap. So there
++    -- the snapshot depends on no region and holds a copy of everything it reaches.
++    let depRegions := if System.Platform.isEmscripten then #[] else env.header.regions
+     let compactor ← (unsafe CompactedRegion.save incrFile `_snap toSave
+-      env.header.regions none (allowClosures := true))
+-    let moduleArts := regionsToModuleArtifacts env.header.regions
++      depRegions none (allowClosures := true))
++    let moduleArts := regionsToModuleArtifacts depRegions
+     IO.FS.writeFile (incrFile.addExtension "deps") (toJson moduleArts).compress
+     Runtime.forget compactor
+ 
+diff --git a/src/Lean/Environment.lean b/src/Lean/Environment.lean
+index 297985fbec..fc783207c6 100644
+--- a/src/Lean/Environment.lean
++++ b/src/Lean/Environment.lean
+@@ -2429,7 +2429,8 @@ private def ImportedModule.getData? (self : ImportedModule) (level : OLeanLevel)
+ /-- The main module data that will eventually be used to construct the kernel environment. -/
+ private def ImportedModule.mainModule? (self : ImportedModule) : Option ModuleData :=
+   if self.hasData then
+-    self.getData? (if self.importAll then .private else .exported)
++    -- in a stripped library without the private part, `import all` sees the exported data
++    self.getData? (if self.importAll then .private else .exported) <|> self.getData? .exported
+   else
+     self.irParts.back?.map (·.1)
+ 
+@@ -2485,9 +2486,14 @@ private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × Com
+     return #[main]
+   -- Opportunistically load all available parts.
+   -- Necessary because the import level may be upgraded a later import.
++  -- A stripped library (the browser build's) may lack the higher parts; load what exists.
+   let sFile := OLeanLevel.server.adjustFileName mFile
++  unless (← sFile.pathExists) do
++    return #[main]
+   let server ← unsafe CompactedRegion.read (α := ModuleData) sFile #[main.2]
+   let pFile := OLeanLevel.private.adjustFileName mFile
++  unless (← pFile.pathExists) do
++    return #[main, server]
+   let priv ← unsafe CompactedRegion.read (α := ModuleData) pFile #[main.2, server.2]
+   return #[main, server, priv]
+ 
+diff --git a/src/Lean/Shell.lean b/src/Lean/Shell.lean
+index eda810d0d6..f5a09bdf0f 100644
+--- a/src/Lean/Shell.lean
++++ b/src/Lean/Shell.lean
+@@ -40,6 +40,64 @@ Before calling this function, the LLVM subsystem must first be successfully init
+ @[extern "lean_emit_llvm"]
+ opaque emitLLVM (env : Environment) (modName : Name) (filepath : FilePath) : IO Unit
+ 
++/-! ## Entry points for a host that keeps one Lean alive
++
++A browser worker cannot afford to start `lean` once per input. It boots Lean once
++(`lean_wasm_boot` in `shell.cpp`), optionally loads an `--incr-header-save` snapshot, and then
++checks many inputs. Environments are kept per header, so only the first input with a given
++header pays for its imports.
++-/
++
++/-- Imported environments by header: the imported module names, and whether the file is a `module`. -/
++builtin_initialize wasmEnvCache :
++    IO.Ref (Array ((Array Name × Bool) × Environment)) ← IO.mkRef #[]
++
++def wasmEnvFor (header : Elab.HeaderSyntax) : IO Environment := do
++  let imports := header.imports
++  let key := (imports.map (·.module), header.isModule)
++  if let some (_, env) := (← wasmEnvCache.get).find? (·.1 == key) then
++    return env
++  -- `withImporting` (inside `importModules`) clears the flag on return
++  unsafe enableInitializersExecution
++  -- The environment outlives this call, so its regions must not be freed (`leakEnv`).
++  let env ← importModules imports {} 0 (loadExts := true) (leakEnv := true)
++    (level := if header.isModule then .exported else .private)
++  wasmEnvCache.modify (·.push (key, env))
++  return env
++
++/--
++Adds the environment of the `--incr-header-save` snapshot at `path` to the cache, so that inputs
++with the same header skip the import. Returns 0 on success and 1 on failure.
++-/
++@[export lean_wasm_load_snapshot]
++def wasmLoadSnapshot (path : String) : IO UInt32 := do
++  try
++    let env ← unsafe Elab.loadHeaderSnapshotEnv ⟨path⟩
++    wasmEnvCache.modify (·.push ((env.header.imports.map (·.module), env.header.isModule), env))
++    return 0
++  catch e =>
++    IO.eprintln s!"loading snapshot {path} failed: {e}"
++    return 1
++
++/--
++Elaborates `code` (a whole file, header included) and prints its messages to stdout, one JSON
++object per line, in the format of `lean --json`. `fileName` only labels the messages and names
++the main module. Returns 0 if there were no errors and 1 otherwise.
++-/
++@[export lean_wasm_check]
++def wasmCheck (code fileName : String) : IO UInt32 := do
++  let inputCtx := Parser.mkInputContext code fileName
++  let (header, parserState, headerMessages) ← Parser.parseHeader inputCtx
++  let mainModule := match (System.FilePath.mk fileName).fileStem with
++    | some stem => Name.mkSimple stem
++    | none => `_stdin
++  let env := (← wasmEnvFor header).setMainModule mainModule
++  let s ← Elab.IO.processCommands inputCtx parserState (Elab.Command.mkState env {} {})
++  let msgs := headerMessages ++ s.commandState.messages
++  for msg in msgs.toList do
++    IO.println (← msg.toJson).compress
++  return if msgs.hasErrors then 1 else 0
++
+ /-- Whether Lean was built with an address sanitizer enabled. -/
+ @[extern "lean_internal_has_address_sanitizer"]
+ opaque Internal.hasAddressSanitizer (_ : Unit) : Bool
+diff --git a/src/runtime/compact.cpp b/src/runtime/compact.cpp
+index 73c9a4e187..ec67f3343d 100644
+--- a/src/runtime/compact.cpp
++++ b/src/runtime/compact.cpp
+@@ -100,6 +100,12 @@ LEAN_EXPORT std::vector<lib_info> get_loaded_libs() {
+         if (!name) continue;
+         libs.push_back({reinterpret_cast<size_t>(hdr), name});
+     }
++#elif defined(LEAN_EMSCRIPTEN)
++    // WebAssembly has no shared libraries and no `dl_iterate_phdr`. A function pointer is an index
++    // into the module's function table, which is fixed for a given binary, so the table is
++    // presented as one library at base 0: closures are saved as ("wasm-main", index) and relocate
++    // as the identity. A region saved by one `lean.wasm` must only be loaded by the same one.
++    libs.push_back({0, "wasm-main"});
+ #else
+     // Linux: use dl_iterate_phdr
+     dl_iterate_phdr([](struct dl_phdr_info * info, size_t, void * data) -> int {
+diff --git a/src/runtime/io.cpp b/src/runtime/io.cpp
+index 9f77e95b8b..e64d753300 100644
+--- a/src/runtime/io.cpp
++++ b/src/runtime/io.cpp
+@@ -1445,18 +1445,15 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
+ #elif defined(LEAN_EMSCRIPTEN)
+     // See https://emscripten.org/docs/api_reference/emscripten.h.html#c.EM_ASM_INT
+     char* appPath = reinterpret_cast<char*>(EM_ASM_INT({
+-        if ((typeof process === "undefined") || (process.release.name !== "node")) {
+-            return 0;
+-        }
+-
+-        var lengthBytes = lengthBytesUTF8(__filename)+1;
++        // Outside Node.js (a browser) there is no executable file. Report a fixed path in the
++        // virtual file system, so that the library directory resolves to `/lib/lean`.
++        var isNode = (typeof process !== "undefined") && process.release && (process.release.name === "node");
++        var path = isNode ? __filename : "/bin/lean";
++        var lengthBytes = lengthBytesUTF8(path)+1;
+         var pathOnWasmHeap = _malloc(lengthBytes);
+-        stringToUTF8(__filename, pathOnWasmHeap, lengthBytes);
++        stringToUTF8(path, pathOnWasmHeap, lengthBytes);
+         return pathOnWasmHeap;
+     }));
+-    if (appPath == nullptr) {
+-        return io_result_mk_error("no Lean executable file exists in WASM outside of Node.js");
+-    }
+ 
+     object * appPathLean = mk_string(appPath);
+     free(appPath);
+diff --git a/src/util/shell.cpp b/src/util/shell.cpp
+index 88f89c65ef..0e17bc922a 100644
+--- a/src/util/shell.cpp
++++ b/src/util/shell.cpp
+@@ -288,6 +288,62 @@ static void report_task_get_blocked_time(std::chrono::nanoseconds d) {
+ extern "C" void __llvm_profile_set_filename(const char *) __attribute__((weak));
+ #endif
+ 
++#ifdef LEAN_EMSCRIPTEN
++// Entry points for a host that keeps one Lean alive and checks many inputs, such as a browser
++// worker. The host never runs `main`: it calls `lean_wasm_boot` once, then the other two.
++// The Lean side is in `src/Lean/Shell.lean`.
++extern "C" obj_res lean_wasm_load_snapshot(obj_arg path);
++extern "C" obj_res lean_wasm_check(obj_arg code, obj_arg file_name);
++extern "C" void emscripten_runtime_keepalive_push(void);
++
++// Runs `f` on a thread with Lean's stack size, as `lean_main` does. Returns 2 if it throws.
++template<class F> static int wasm_run(F && f) {
++    int rc = 2;
++    run_with_thread_stack([&]() {
++        try {
++            rc = get_io_uint32_result(f());
++        } catch (lean::throwable & ex) {
++            std::cerr << ex.what() << std::endl;
++        } catch (std::bad_alloc & ex) {
++            std::cerr << "out of memory" << std::endl;
++        }
++    });
++    return rc;
++}
++
++/* Initializes Lean and starts `num_threads` task-manager threads. Returns 0 on success. */
++extern "C" LEAN_EXPORT int lean_wasm_boot(unsigned num_threads) {
++    if (__llvm_profile_set_filename) {
++        __llvm_profile_set_filename("/dev/null");
++    }
++    // `lean.js` is linked with `EXIT_RUNTIME=1` for the command line. Without this, the runtime
++    // would exit, and close stdout, the first time the host's event loop runs dry.
++    emscripten_runtime_keepalive_push();
++    new lean::initializer();  // lives as long as the page
++    try {
++        init_search_path();
++    } catch (lean::throwable & ex) {
++        std::cerr << "error: " << ex.what() << std::endl;
++        return 1;
++    }
++    lean_enable_initializer_execution();
++    lean::io_mark_end_initialization();
++    lean_init_task_manager_using(num_threads);
++    return 0;
++}
++
++/* Loads an `--incr-header-save` snapshot. Returns 0 on success. */
++extern "C" LEAN_EXPORT int lean_wasm_load_snapshot_file(char const * path) {
++    return wasm_run([&]() { return lean_wasm_load_snapshot(lean_mk_string(path)); });
++}
++
++/* Checks a whole Lean file given as text; messages go to stdout as JSON lines.
++   Returns 0 if there were no errors, 1 if there were, 2 if the check itself failed. */
++extern "C" LEAN_EXPORT int lean_wasm_check_source(char const * code, char const * file_name) {
++    return wasm_run([&]() { return lean_wasm_check(lean_mk_string(code), lean_mk_string(file_name)); });
++}
++#endif
++
+ extern "C" LEAN_EXPORT int lean_main(int argc, char ** argv) {
+ #ifdef LEAN_EMSCRIPTEN
+     if (__llvm_profile_set_filename) {
